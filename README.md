@@ -1,106 +1,301 @@
-# <img src="logo.svg" alt="OpenZeppelin" height="40px">
+#!/usr/bin/env python3
+# bot.py - Tbillionz Cloud Trading Bot (Binance + MT4 Bridge)
+# Requirements: python-telegram-bot==20.3, ccxt, requests, PyYAML
 
-[![Github Release](https://img.shields.io/github/v/tag/OpenZeppelin/openzeppelin-contracts.svg?filter=v*&sort=semver&label=github)](https://github.com/OpenZeppelin/openzeppelin-contracts/releases/latest)
-[![NPM Package](https://img.shields.io/npm/v/@openzeppelin/contracts.svg)](https://www.npmjs.org/package/@openzeppelin/contracts)
-[![Coverage Status](https://codecov.io/gh/OpenZeppelin/openzeppelin-contracts/graph/badge.svg)](https://codecov.io/gh/OpenZeppelin/openzeppelin-contracts)
-[![GitPOAPs](https://public-api.gitpoap.io/v1/repo/OpenZeppelin/openzeppelin-contracts/badge)](https://www.gitpoap.io/gh/OpenZeppelin/openzeppelin-contracts)
-[![Docs](https://img.shields.io/badge/docs-%F0%9F%93%84-yellow)](https://docs.openzeppelin.com/contracts)
-[![Forum](https://img.shields.io/badge/forum-%F0%9F%92%AC-yellow)](https://forum.openzeppelin.com/)
+import asyncio
+import logging
+import json
+import time
+from typing import Optional
+import requests
+import ccxt
+import yaml
+from decimal import Decimal, ROUND_DOWN
 
-**A library for secure smart contract development.** Build on a solid foundation of community-vetted code.
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
- * Implementations of standards like [ERC20](https://docs.openzeppelin.com/contracts/erc20) and [ERC721](https://docs.openzeppelin.com/contracts/erc721).
- * Flexible [role-based permissioning](https://docs.openzeppelin.com/contracts/access-control) scheme.
- * Reusable [Solidity components](https://docs.openzeppelin.com/contracts/utilities) to build custom contracts and complex decentralized systems.
+# -------------------------
+# Load config
+# -------------------------
+with open("config/config.yaml", "r") as f:
+    CFG = yaml.safe_load(f)
 
-:mage: **Not sure how to get started?** Check out [Contracts Wizard](https://wizard.openzeppelin.com/) — an interactive smart contract generator.
+BOT_TOKEN = CFG.get("telegram_token")
+ALLOWED_USERS = CFG.get("allowed_telegram_user_ids", [])
+PAPER_MODE = CFG.get("paper_mode", True)
 
-> [!IMPORTANT]
-> OpenZeppelin Contracts uses semantic versioning to communicate backwards compatibility of its API and storage layout. For upgradeable contracts, the storage layout of different major versions should be assumed incompatible, for example, it is unsafe to upgrade from 4.9.3 to 5.0.0. Learn more at [Backwards Compatibility](https://docs.openzeppelin.com/contracts/backwards-compatibility).
+BINANCE_API_KEY = CFG.get("binance_api_key")
+BINANCE_API_SECRET = CFG.get("binance_api_secret")
+EXCHANGE_ID = CFG.get("exchange", "binance")
+MT4_BRIDGE_URL = CFG.get("mt4_bridge_url")  # e.g. http://vps:5000/trade
+MT4_BRIDGE_TOKEN = CFG.get("mt4_bridge_token", "")
 
-## Overview
+# Trading defaults
+DEFAULT_RISK_PCT = float(CFG.get("default_risk_pct", 1.0))  # percent of capital per trade
+DEFAULT_SL_PTS = int(CFG.get("default_sl_pts", 200))       # points (for forex) or ticks
+DEFAULT_TP_PTS = int(CFG.get("default_tp_pts", 400))
 
-### Installation
+# -------------------------
+# Logging & state
+# -------------------------
+logging.basicConfig(format="%(asctime)s %(levelname)s: %(message)s", level=logging.INFO)
+log = logging.getLogger("tbillionz_bot")
 
-#### Hardhat (npm)
+# In-memory order book for tracking simulated/paper orders
+ORDERS = []
+BOT_RUNNING = True
+RISK_PCT = DEFAULT_RISK_PCT
 
-```
-$ npm install @openzeppelin/contracts
-```
+# -------------------------
+# Setup exchange (ccxt)
+# -------------------------
+exchange = None
+if not PAPER_MODE:
+    try:
+        exchange = getattr(ccxt, EXCHANGE_ID)({
+            "apiKey": BINANCE_API_KEY,
+            "secret": BINANCE_API_SECRET,
+            "enableRateLimit": True,
+        })
+        exchange.options["createMarketBuyOrderRequiresPrice"] = False
+    except Exception as e:
+        log.error("Failed to init exchange: %s", e)
+        exchange = None
 
-#### Foundry (git)
+# -------------------------
+# Helpers
+# -------------------------
+def authorized(user_id: int) -> bool:
+    if not ALLOWED_USERS:
+        return True
+    return user_id in ALLOWED_USERS
 
-> [!WARNING]
-> When installing via git, it is a common error to use the `master` branch. This is a development branch that should be avoided in favor of tagged releases. The release process involves security measures that the `master` branch does not guarantee.
+async def auth_check(update: Update) -> bool:
+    uid = update.effective_user.id
+    if not authorized(uid):
+        try:
+            await update.message.reply_text("Unauthorized ❌")
+        except: pass
+        log.warning("Unauthorized access attempt by %s", uid)
+        return False
+    return True
 
-> [!WARNING]
-> Foundry installs the latest version initially, but subsequent `forge update` commands will use the `master` branch.
+def quantize_amount(amount: float, step: Optional[float]) -> float:
+    if not step:
+        return float(round(amount, 8))
+    # step like 0.0001 -> decimal quantize
+    s = Decimal(str(step))
+    a = Decimal(str(amount)).quantize(s, rounding=ROUND_DOWN)
+    return float(a)
 
-```
-$ forge install OpenZeppelin/openzeppelin-contracts
-```
+def symbol_is_crypto(symbol: str) -> bool:
+    # naive: if endswith USDT or BTC etc.
+    symbol = symbol.replace("/", "").upper()
+    return symbol.endswith("USDT") or symbol.endswith("BUSD") or symbol.endswith("BTC")
 
-Add `@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/` in `remappings.txt`.
+# -------------------------
+# Execution
+# -------------------------
+def place_ccxt_market_order(symbol: str, side: str, qty: float):
+    # wrapper with simple error handling
+    try:
+        # ccxt symbol format: "BTC/USDT"
+        ccxt_symbol = symbol if "/" in symbol else f"{symbol[:-4]}/{symbol[-4:]}" if len(symbol) > 4 else symbol
+        if not exchange:
+            raise RuntimeError("Exchange not initialized")
+        order = exchange.create_market_order(ccxt_symbol, side.lower(), qty)
+        return {"ok": True, "order": order}
+    except Exception as e:
+        log.exception("ccxt order failed")
+        return {"ok": False, "error": str(e)}
 
-### Usage
-
-Once installed, you can use the contracts in the library by importing them:
-
-```solidity
-pragma solidity ^0.8.20;
-
-import {ERC721} from "@openzeppelin/contracts/token/ERC721/ERC721.sol";
-
-contract MyCollectible is ERC721 {
-    constructor() ERC721("MyCollectible", "MCO") {
+def send_to_mt4_bridge(symbol: str, side: str, qty: float, sl: Optional[float]=None, tp: Optional[float]=None):
+    payload = {
+        "token": MT4_BRIDGE_TOKEN,
+        "symbol": symbol,
+        "side": side,
+        "qty": qty,
+        "sl": sl,
+        "tp": tp,
     }
-}
-```
+    try:
+        r = requests.post(MT4_BRIDGE_URL, json=payload, timeout=10)
+        return {"ok": r.status_code == 200, "status_code": r.status_code, "text": r.text}
+    except Exception as e:
+        log.exception("MT4 bridge error")
+        return {"ok": False, "error": str(e)}
 
-_If you're new to smart contract development, head to [Developing Smart Contracts](https://docs.openzeppelin.com/learn/developing-smart-contracts) to learn about creating a new project and compiling your contracts._
+# Paper order store
+def add_paper_order(symbol, side, qty, price=None, sl=None, tp=None):
+    order = {
+        "id": int(time.time()*1000),
+        "symbol": symbol,
+        "side": side,
+        "qty": qty,
+        "price": price,
+        "sl": sl,
+        "tp": tp,
+        "ts": time.time()
+    }
+    ORDERS.append(order)
+    return order
 
-To keep your system secure, you should **always** use the installed code as-is, and neither copy-paste it from online sources nor modify it yourself. The library is designed so that only the contracts and functions you use are deployed, so you don't need to worry about it needlessly increasing gas costs.
+# -------------------------
+# Strategy (simple EMA+RSI example)
+# -------------------------
+import numpy as np
+def simple_strategy_decision(ohlcv):
+    # ohlcv: list of [ts, o, h, l, c, v]
+    closes = np.array([c for _,o,h,l,c,v in ohlcv])
+    if len(closes) < 50:
+        return None
+    ema_fast = np.mean(closes[-9:])
+    ema_slow = np.mean(closes[-21:])
+    # naive cross
+    if ema_fast > ema_slow and (closes[-1] > closes[-2]):
+        return "BUY"
+    if ema_fast < ema_slow and (closes[-1] < closes[-2]):
+        return "SELL"
+    return None
 
-## Learn More
+# -------------------------
+# Telegram Handlers
+# -------------------------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await auth_check(update): return
+    await update.message.reply_text(f"Tbillionz Bot online. Mode: {'PAPER' if PAPER_MODE else 'LIVE'}")
 
-The guides in the [documentation site](https://docs.openzeppelin.com/contracts) will teach about different concepts, and how to use the related contracts that OpenZeppelin Contracts provides:
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await auth_check(update): return
+    txt = (
+        "/status - bot status\n"
+        "/trade SYMBOL SIDE QTY [sl] [tp] - execute trade\n"
+        "/buy SYMBOL QTY\n"
+        "/sell SYMBOL QTY\n"
+        "/balance - show exchange/paper balance\n"
+        "/orders - list paper/open orders\n"
+        "/close_all - close all paper orders (or call bridge to close all on MT4)\n"
+        "/paper_on /paper_off - toggle paper mode in config (restart needed)\n"
+        "/set_risk PCT - set risk percent per trade\n        "
+    )
+    await update.message.reply_text(txt)
 
-* [Access Control](https://docs.openzeppelin.com/contracts/access-control): decide who can perform each of the actions on your system.
-* [Tokens](https://docs.openzeppelin.com/contracts/tokens): create tradeable assets or collectibles for popular ERC standards like ERC-20, ERC-721, ERC-1155, and ERC-6909.
-* [Utilities](https://docs.openzeppelin.com/contracts/utilities): generic useful tools including non-overflowing math, signature verification, and trustless paying systems.
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await auth_check(update): return
+    await update.message.reply_text(f"Running: {BOT_RUNNING}\nPaper mode: {PAPER_MODE}\nOrders tracked: {len(ORDERS)}\nRisk%: {RISK_PCT}")
 
-The [full API](https://docs.openzeppelin.com/contracts/api/token/ERC20) is also thoroughly documented, and serves as a great reference when developing your smart contract application. You can also ask for help or follow Contracts' development in the [community forum](https://forum.openzeppelin.com).
+async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await auth_check(update): return
+    if PAPER_MODE:
+        await update.message.reply_text("Balance (paper): 10000 USDT")
+        return
+    if exchange:
+        try:
+            bal = exchange.fetch_balance()
+            usdt = bal.get('total', {}).get('USDT', 0)
+            await update.message.reply_text(f"Balance USDT: {usdt}")
+        except Exception as e:
+            await update.message.reply_text(f"Error fetching balance: {e}")
+    else:
+        await update.message.reply_text("Exchange not initialized")
 
-Finally, you may want to take a look at the [guides on our blog](https://blog.openzeppelin.com/), which cover several common use cases and good practices. The following articles provide great background reading, though please note that some of the referenced tools have changed, as the tooling in the ecosystem continues to rapidly evolve.
+async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await auth_check(update): return
+    if not ORDERS:
+        await update.message.reply_text("No paper orders.")
+        return
+    text = "\n".join([f"{o['id']} {o['side']} {o['qty']} {o['symbol']}" for o in ORDERS])
+    await update.message.reply_text(text)
 
-* [The Hitchhiker’s Guide to Smart Contracts in Ethereum](https://blog.openzeppelin.com/the-hitchhikers-guide-to-smart-contracts-in-ethereum-848f08001f05) will help you get an overview of the various tools available for smart contract development, and help you set up your environment.
-* [A Gentle Introduction to Ethereum Programming, Part 1](https://blog.openzeppelin.com/a-gentle-introduction-to-ethereum-programming-part-1-783cc7796094) provides very useful information on an introductory level, including many basic concepts from the Ethereum platform.
-* For a more in-depth dive, you may read the guide [Designing the Architecture for Your Ethereum Application](https://blog.openzeppelin.com/designing-the-architecture-for-your-ethereum-application-9cec086f8317), which discusses how to better structure your application and its relationship to the real world.
+async def close_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await auth_check(update): return
+    ORDERS.clear()
+    await update.message.reply_text("All paper orders cleared (for live, use exchange/MT4 API).")
 
-## Security
+async def set_risk(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global RISK_PCT
+    if not await auth_check(update): return
+    args = context.args
+    if not args:
+        await update.message.reply_text("Usage: /set_risk PERCENT")
+        return
+    try:
+        pct = float(args[0])
+        RISK_PCT = pct
+        await update.message.reply_text(f"Risk set to {RISK_PCT}%")
+    except:
+        await update.message.reply_text("Invalid percent")
 
-This project is maintained by [OpenZeppelin](https://openzeppelin.com) with the goal of providing a secure and reliable library of smart contract components for the ecosystem. We address security through risk management in various areas such as engineering and open source best practices, scoping and API design, multi-layered review processes, and incident response preparedness.
+async def trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await auth_check(update): return
+    args = context.args
+    if len(args) < 3:
+        await update.message.reply_text("Usage: /trade SYMBOL SIDE QTY [sl] [tp]\nExample: /trade BTC/USDT BUY 0.001")
+        return
+    symbol = args[0].upper()
+    side = args[1].upper()
+    qty = float(args[2])
+    sl = float(args[3]) if len(args) >= 4 else None
+    tp = float(args[4]) if len(args) >= 5 else None
 
-The [OpenZeppelin Contracts Security Center](https://contracts.openzeppelin.com/security) contains more details about the secure development process.
+    # Paper mode
+    if PAPER_MODE:
+        o = add_paper_order(symbol, side, qty, price=None, sl=sl, tp=tp)
+        await update.message.reply_text(f"[PAPER] Simulated {side} {qty} {symbol} (id:{o['id']})")
+        return
 
-The security policy is detailed in [`SECURITY.md`](./SECURITY.md) as well, and specifies how you can report security vulnerabilities, which versions will receive security patches, and how to stay informed about them. We run a [bug bounty program on Immunefi](https://immunefi.com/bounty/openzeppelin) to reward the responsible disclosure of vulnerabilities.
+    # Live: route to crypto or MT4
+    if symbol_is_crypto(symbol.replace("/", "")):
+        # ccxt expects "BTC/USDT"
+        s = symbol if "/" in symbol else symbol.replace("", "")
+        res = place_ccxt_market_order(s, side, qty)
+        if res.get("ok"):
+            await update.message.reply_text(f"✅ LIVE {side} {qty} {symbol} executed. {res.get('order')}")
+        else:
+            await update.message.reply_text(f"❌ Exchange error: {res.get('error')}")
+    else:
+        res = send_to_mt4_bridge(symbol, side, qty, sl=sl, tp=tp)
+        if res.get("ok"):
+            await update.message.reply_text(f"✅ Sent to MT4 bridge: {side} {qty} {symbol}")
+        else:
+            await update.message.reply_text(f"❌ MT4 bridge error: {res}")
 
-The engineering guidelines we follow to promote project quality can be found in [`GUIDELINES.md`](./GUIDELINES.md).
+# convenience buy/sell
+async def buy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await auth_check(update): return
+    args = context.args
+    if len(args) < 2:
+        await update.message.reply_text("Usage: /buy SYMBOL QTY")
+        return
+    await trade(update, context)
 
-Past audits can be found in [`audits/`](./audits).
+async def sell_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await auth_check(update): return
+    args = context.args
+    if len(args) < 2:
+        await update.message.reply_text("Usage: /sell SYMBOL QTY")
+        return
+    await trade(update, context)
 
-Smart contracts are a nascent technology and carry a high level of technical risk and uncertainty. Although OpenZeppelin is well known for its security audits, using OpenZeppelin Contracts is not a substitute for a security audit.
+# -------------------------
+# Entry point
+# -------------------------
+def main():
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("status", status))
+    app.add_handler(CommandHandler("balance", balance))
+    app.add_handler(CommandHandler("orders", orders_cmd))
+    app.add_handler(CommandHandler("close_all", close_all))
+    app.add_handler(CommandHandler("set_risk", set_risk))
+    app.add_handler(CommandHandler("trade", trade))
+    app.add_handler(CommandHandler("buy", buy_cmd))
+    app.add_handler(CommandHandler("sell", sell_cmd))
 
-OpenZeppelin Contracts is made available under the MIT License, which disclaims all warranties in relation to the project and which limits the liability of those that contribute and maintain the project, including OpenZeppelin. As set out further in the Terms, you acknowledge that you are solely responsible for any use of OpenZeppelin Contracts and you assume all risks associated with any such use.
+    log.info("Tbillionz cloud bot starting...")
+    app.run_polling()
 
-## Contribute
-
-OpenZeppelin Contracts exists thanks to its contributors. There are many ways you can participate and help build high quality software. Check out the [contribution guide](CONTRIBUTING.md)!
-
-## License
-
-OpenZeppelin Contracts is released under the [MIT License](LICENSE).
-
-## Legal
-
-Your use of this Project is governed by the terms found at www.openzeppelin.com/tos (the "Terms").
+if __name__ == "__main__":
+    main()
