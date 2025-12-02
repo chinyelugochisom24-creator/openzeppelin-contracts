@@ -1,0 +1,302 @@
+import time
+import random
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+from sqlalchemy import create_engine
+from telegram import Bot
+from dash import Dash, dcc, html
+from dash.dependencies import Output, Input
+import dash_bootstrap_components as dbc
+import threading
+
+# ========== CONFIG ==========
+TELEGRAM_API_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
+TELEGRAM_CHAT_ID = "YOUR_CHAT_ID"
+DB_FILE = "6g_system_v2.db"
+NODES = ["Node-1", "Node-2", "Node-3", "Node-4"]
+MONITOR_INTERVAL = 5  # seconds
+PREDICTION_WINDOW = 5  # last N points
+# ============================
+
+bot = Bot(token=TELEGRAM_API_TOKEN)
+engine = create_engine(f"sqlite:///{DB_FILE}")
+metrics_log = pd.DataFrame()
+
+# ---------------- NETWORK SIMULATION ----------------
+def get_network_metrics(node):
+    return {
+        "node": node,
+        "latency_ms": random.uniform(0.1, 2.0),
+        "bandwidth_gbps": random.uniform(500, 1000),
+        "packet_loss_percent": random.uniform(0, 0.5),
+        "signal_quality": random.uniform(95, 100),
+        "timestamp": pd.Timestamp.now()
+    }
+
+def evaluate_network(metrics):
+    alerts = []
+    if metrics["latency_ms"] > 1.5:
+        alerts.append(f"{metrics['node']}: High latency!")
+    if metrics["packet_loss_percent"] > 0.3:
+        alerts.append(f"{metrics['node']}: Packet loss warning!")
+    if metrics["bandwidth_gbps"] < 600:
+        alerts.append(f"{metrics['node']}: Bandwidth low!")
+    return alerts
+
+# ---------------- AI PREDICTION ----------------
+class LSTMModel(nn.Module):
+    def __init__(self, input_size=4, hidden_size=50, num_layers=1, output_size=1):
+        super(LSTMModel, self).__init__()
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
+        self.fc = nn.Linear(hidden_size, output_size)
+
+    def forward(self, x):
+        out, _ = self.lstm(x)
+        out = self.fc(out[:, -1, :])
+        return out
+
+def prepare_data(df, node):
+    node_df = df[df["node"] == node].copy()
+    features = node_df[["latency_ms", "bandwidth_gbps", "packet_loss_percent", "signal_quality"]].values
+    if len(features) < PREDICTION_WINDOW:
+        return None
+    x = []
+    for i in range(len(features) - PREDICTION_WINDOW):
+        x.append(features[i:i+PREDICTION_WINDOW])
+    return torch.tensor(x, dtype=torch.float32)
+
+def predict_congestion(df, node):
+    data = prepare_data(df, node)
+    if data is None:
+        return None
+    model = LSTMModel()
+    # For prototype, we skip training and use last value as prediction
+    with torch.no_grad():
+        pred = model(data)
+    return pred[-1][0].item()  # predicted latency
+
+# ---------------- OPTIMIZATION ENGINE ----------------
+def optimization_suggestions(metrics):
+    suggestions = []
+    if metrics["latency_ms"] > 1.5:
+        suggestions.append(f"{metrics['node']}: Increase bandwidth allocation.")
+    if metrics["packet_loss_percent"] > 0.3:
+        suggestions.append(f"{metrics['node']}: Adjust QoS priorities.")
+    if metrics["signal_quality"] < 95:
+        suggestions.append(f"{metrics['node']}: Check coverage or redirect traffic.")
+    return suggestions
+
+# ---------------- METRICS COLLECTION ----------------
+def collect_metrics():
+    global metrics_log
+    while True:
+        all_metrics = []
+        for node in NODES:
+            metrics = get_network_metrics(node)
+            all_metrics.append(metrics)
+            alerts = evaluate_network(metrics)
+            for alert in alerts:
+                bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"🚨 ALERT: {alert}")
+            suggestions = optimization_suggestions(metrics)
+            for s in suggestions:
+                bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"💡 Suggestion: {s}")
+        metrics_log = pd.concat([metrics_log, pd.DataFrame(all_metrics)], ignore_index=True)
+        metrics_log.to_sql("metrics", engine, if_exists="replace", index=False)
+        time.sleep(MONITOR_INTERVAL)
+
+# ---------------- DASHBOARD SETUP ----------------
+app = Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP])
+app.layout = dbc.Container([
+    html.H1("6G Network System Dashboard v2"),
+    dcc.Interval(id="interval-update", interval=MONITOR_INTERVAL*1000, n_intervals=0),
+    dbc.Row([
+        dbc.Col(dcc.Graph(id="latency-graph"), width=6),
+        dbc.Col(dcc.Graph(id="bandwidth-graph"), width=6)
+    ]),
+    dbc.Row([
+        dbc.Col(dcc.Graph(id="packetloss-graph"), width=6),
+        dbc.Col(dcc.Graph(id="signal-graph"), width=6)
+    ]),
+    dbc.Row([
+        dbc.Col(dcc.Graph(id="heatmap-graph"), width=12)
+    ])
+])
+
+@app.callback(
+    Output("latency-graph", "figure"),
+    Output("bandwidth-graph", "figure"),
+    Output("packetloss-graph", "figure"),
+    Output("signal-graph", "figure"),
+    Output("heatmap-graph", "figure"),
+    Input("interval-update", "n_intervals")
+)
+def update_graphs(n):
+    fig_latency = {
+        "data": [{"x": metrics_log[metrics_log["node"] == node]["timestamp"],
+                  "y": metrics_log[metrics_log["node"] == node]["latency_ms"],
+                  "name": node} for node in NODES],
+        "layout": {"title": "Latency (ms)", "yaxis": {"range": [0, 3]}}
+    }
+    fig_bandwidth = {
+        "data": [{"x": metrics_log[metrics_log["node"] == node]["timestamp"],
+                  "y": metrics_log[metrics_log["node"] == node]["bandwidth_gbps"],
+                  "name": node} for node in NODES],
+        "layout": {"title": "Bandwidth (Gbps)", "yaxis": {"range": [400, 1100]}}
+    }
+    fig_packet = {
+        "data": [{"x": metrics_log[metrics_log["node"] == node]["timestamp"],
+                  "y": metrics_log[metrics_log["node"] == node]["packet_loss_percent"],
+                  "name": node} for node in NODES],
+        "layout": {"title": "Packet Loss (%)", "yaxis": {"range": [0, 1]}}
+    }
+    fig_signal = {
+        "data": [{"x": metrics_log[metrics_log["node"] == node]["timestamp"],
+                  "y": metrics_log[metrics_log["node"] == node]["signal_quality"],
+                  "name": node} for node in NODES],
+        "layout": {"title": "Signal Quality (%)", "yaxis": {"range": [90, 100]}}
+    }
+
+    # Heatmap by node and latency
+    heatmap_data = metrics_log.groupby("node").tail(1)
+    fig_heatmap = {
+        "data": [{
+            "x": heatmap_data["node"],
+            "y": [1]*len(heatmap_data),
+            "z": heatmap_data["latency_ms"],
+            "type": "heatmap",
+            "colorscale": "RdYlGn_r"
+        }],
+        "layout": {"title": "Latency Heatmap", "yaxis": {"visible": False}}
+    }
+
+    return fig_latency, fig_bandwidth, fig_packet, fig_signal, fig_heatmap
+
+# ---------------- RUN SYSTEM ----------------
+if __name__ == "__main__":
+    threading.Thread(target=collect_metrics, daemon=True).start()
+    app.run_server(debug=True)import time
+import random
+import pandas as pd
+import numpy as np
+from sklearn.linear_model import LinearRegression
+from sqlalchemy import create_engine
+from telegram import Bot
+from dash import Dash, dcc, html
+from dash.dependencies import Output, Input
+import dash_bootstrap_components as dbc
+import threading
+
+# ========== CONFIG ==========
+TELEGRAM_API_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
+TELEGRAM_CHAT_ID = "YOUR_CHAT_ID"
+DB_FILE = "6g_system.db"
+NODES = ["Node-1", "Node-2", "Node-3", "Node-4"]
+MONITOR_INTERVAL = 5  # seconds
+# ============================
+
+bot = Bot(token=TELEGRAM_API_TOKEN)
+engine = create_engine(f"sqlite:///{DB_FILE}")
+
+metrics_log = pd.DataFrame()
+
+# ---------------- NETWORK SIMULATION ----------------
+def get_network_metrics(node):
+    return {
+        "node": node,
+        "latency_ms": random.uniform(0.1, 2.0),
+        "bandwidth_gbps": random.uniform(500, 1000),
+        "packet_loss_percent": random.uniform(0, 0.5),
+        "signal_quality": random.uniform(95, 100),
+        "timestamp": pd.Timestamp.now()
+    }
+
+def evaluate_network(metrics):
+    alerts = []
+    if metrics["latency_ms"] > 1.5:
+        alerts.append(f"{metrics['node']}: High latency!")
+    if metrics["packet_loss_percent"] > 0.3:
+        alerts.append(f"{metrics['node']}: Packet loss warning!")
+    if metrics["bandwidth_gbps"] < 600:
+        alerts.append(f"{metrics['node']}: Bandwidth low!")
+    return alerts
+
+def predict_latency(df, node):
+    node_df = df[df["node"] == node].copy()
+    if len(node_df) < 5:
+        return None
+    X = np.array(range(len(node_df))).reshape(-1, 1)
+    y = node_df["latency_ms"].values
+    model = LinearRegression().fit(X, y)
+    pred = model.predict([[len(node_df)]])
+    return pred[0]
+
+# ---------------- METRICS COLLECTION ----------------
+def collect_metrics():
+    global metrics_log
+    while True:
+        all_metrics = []
+        for node in NODES:
+            metrics = get_network_metrics(node)
+            all_metrics.append(metrics)
+            alerts = evaluate_network(metrics)
+            for alert in alerts:
+                bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"🚨 ALERT: {alert}")
+        metrics_log = pd.concat([metrics_log, pd.DataFrame(all_metrics)], ignore_index=True)
+        metrics_log.to_sql("metrics", engine, if_exists="replace", index=False)
+        time.sleep(MONITOR_INTERVAL)
+
+# ---------------- DASHBOARD SETUP ----------------
+app = Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP])
+app.layout = dbc.Container([
+    html.H1("6G Network System Dashboard"),
+    dcc.Interval(id="interval-update", interval=MONITOR_INTERVAL*1000, n_intervals=0),
+    dbc.Row([
+        dbc.Col(dcc.Graph(id="latency-graph"), width=6),
+        dbc.Col(dcc.Graph(id="bandwidth-graph"), width=6)
+    ]),
+    dbc.Row([
+        dbc.Col(dcc.Graph(id="packetloss-graph"), width=6),
+        dbc.Col(dcc.Graph(id="signal-graph"), width=6)
+    ])
+])
+
+@app.callback(
+    Output("latency-graph", "figure"),
+    Output("bandwidth-graph", "figure"),
+    Output("packetloss-graph", "figure"),
+    Output("signal-graph", "figure"),
+    Input("interval-update", "n_intervals")
+)
+def update_graphs(n):
+    fig_latency = {
+        "data": [{"x": metrics_log[metrics_log["node"] == node]["timestamp"],
+                  "y": metrics_log[metrics_log["node"] == node]["latency_ms"],
+                  "name": node} for node in NODES],
+        "layout": {"title": "Latency (ms)", "yaxis": {"range": [0, 3]}}
+    }
+    fig_bandwidth = {
+        "data": [{"x": metrics_log[metrics_log["node"] == node]["timestamp"],
+                  "y": metrics_log[metrics_log["node"] == node]["bandwidth_gbps"],
+                  "name": node} for node in NODES],
+        "layout": {"title": "Bandwidth (Gbps)", "yaxis": {"range": [400, 1100]}}
+    }
+    fig_packet = {
+        "data": [{"x": metrics_log[metrics_log["node"] == node]["timestamp"],
+                  "y": metrics_log[metrics_log["node"] == node]["packet_loss_percent"],
+                  "name": node} for node in NODES],
+        "layout": {"title": "Packet Loss (%)", "yaxis": {"range": [0, 1]}}
+    }
+    fig_signal = {
+        "data": [{"x": metrics_log[metrics_log["node"] == node]["timestamp"],
+                  "y": metrics_log[metrics_log["node"] == node]["signal_quality"],
+                  "name": node} for node in NODES],
+        "layout": {"title": "Signal Quality (%)", "yaxis": {"range": [90, 100]}}
+    }
+    return fig_latency, fig_bandwidth, fig_packet, fig_signal
+
+# ---------------- RUN SYSTEM ----------------
+if __name__ == "__main__":
+    threading.Thread(target=collect_metrics, daemon=True).start()
+    app.run_server(debug=True)
